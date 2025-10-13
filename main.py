@@ -101,6 +101,85 @@ def rotate_around_arbitrary_center(input_image, angle_degrees, center_ratio):
     return rotated
 
 
+def detect_hough_circles(input_image):
+    # Hough circles on blurred gray
+    gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (11, 11), 0)
+
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=2.5,
+        minDist=10,
+        param1=260,
+        param2=120,
+        minRadius=0,
+        maxRadius=0
+    )
+
+    output = input_image.copy()
+    if circles is not None:
+        circles = np.uint16(np.around(circles[0, :]))
+        for x, y, r in circles:
+            cv2.circle(output, (x, y), r, (0, 255, 0), 2)
+            cv2.circle(output, (x, y), 2, (0, 255, 0), 3)
+    return output
+
+
+def detect_hough_lines(input_image):
+    # Hough lines (more lines, thinner)
+    gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    median_intensity = np.median(gray)
+    k = 0.75
+    lower = int(max(0, (1.0 - k) * median_intensity))
+    upper = int(min(255, (1.0 + k) * median_intensity))
+    edges = cv2.Canny(gray, lower, upper)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=10, minLineLength=25, maxLineGap=15)
+    output = input_image.copy()
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            cv2.line(output, (x1, y1), (x2, y2), (0, 0, 255), 1, cv2.LINE_AA)
+    return output
+
+
+def local_stats_features(input_image):
+    # Local mean and std on gray; visualize as false-color (R=std, G=mean, B=0)
+    gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    k = (5, 5)
+    mean = cv2.blur(gray, k)
+    mean_sq = cv2.blur(gray * gray, k)
+    var = np.maximum(mean_sq - mean * mean, 0.0)
+    std = np.sqrt(var)
+
+    mean_u8 = cv2.normalize(mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    std_u8 = cv2.normalize(std,  None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    zeros = np.zeros_like(mean_u8)
+    return cv2.merge([zeros, mean_u8, std_u8])
+
+
+def texture_segmentation_from_seed(input_image, seed_point, window_size=11, t_mean=12.0, t_std=6.0):
+    # Seeded segmentation by local mean/std similarity
+    gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    k = (window_size, window_size)
+    mean = cv2.blur(gray, k)
+    mean_sq = cv2.blur(gray * gray, k)
+    var = np.maximum(mean_sq - mean * mean, 0.0)
+    std = np.sqrt(var)
+
+    sx, sy = int(seed_point[0]), int(seed_point[1])
+    seed_mean = mean[sy, sx]
+    seed_std = std[sy, sx]
+
+    mask = (np.abs(mean - seed_mean) <= t_mean) & (np.abs(std - seed_std) <= t_std)
+
+    result = input_image.copy()
+    result[mask] = (input_image[mask] * 0.7 + np.array([0, 0, 255])).clip(0, 255).astype(np.uint8)  # red tint
+    return result
+
+
 def save_image_via_dialog(image_to_save):
     # Save image via file dialog
     root = Tk()
@@ -118,6 +197,14 @@ def reset_to_original(original_image):
     return original_image.copy()
 
 
+mouse_click_queue = queue.Queue()
+
+
+def on_mouse(event, x, y, flags, param):
+    # Push left-click coordinates
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_click_queue.put((x, y))
+
 def print_menu():
     print("\nConsole menu:")
     print("1 - grayscale (average RGB)")
@@ -134,13 +221,17 @@ def print_menu():
     print("12 - cyclic 50 pixel shift")
     print("13 - rotate around arbitrary center")
     print("14 - reset to original")
+    print("15 - Hough lines")
+    print("16 - Hough circles")
+    print("17 - local stats (mean/std)")
+    print("18 - texture segmentation (click seed on RIGHT image)")
     print("0 - exit")
     print("Enter command:")
 
 
 def load_image_via_dialog():
     # Load image from file dialog
-    root = Tk();
+    root = Tk()
     root.withdraw()
     file_path = filedialog.askopenfilename()
     image = cv2.imread(file_path)
@@ -181,7 +272,6 @@ def read_console_commands(command_queue):
             break
 
 
-
 def main():
     original_image = load_image_via_dialog()
     edited_image = original_image.copy()
@@ -190,14 +280,16 @@ def main():
     print_menu()
 
     show_side_by_side(original_image, edited_image, window_title)
-
+    cv2.setMouseCallback(window_title, on_mouse)
+    original_width = original_image.shape[1]
+    segmentation_waiting_for_click = False
     command_queue = queue.Queue()
     input_thread = threading.Thread(target=read_console_commands, args=(command_queue,), daemon=True)
     input_thread.start()
 
     running = True
     while running:
-        cv2.waitKey(30)  # keep window responsive
+        cv2.waitKey(30)
 
         while not command_queue.empty():
             command = command_queue.get()
@@ -246,9 +338,27 @@ def main():
                 )
             elif command == "14":
                 edited_image = reset_to_original(original_image)
+            elif command == "15":
+                edited_image = detect_hough_lines(edited_image)
+            elif command == "16":
+                edited_image = detect_hough_circles(edited_image)
+            elif command == "17":
+                edited_image = local_stats_features(edited_image)
+            elif command == "18":
+                print("Click seed on RIGHT image to segment by local texture similarity")
+                segmentation_waiting_for_click = True
             elif command == "0":
                 running = False
-
+            if segmentation_waiting_for_click and not mouse_click_queue.empty():
+                click_x, click_y = mouse_click_queue.get()
+                if click_x >= original_width:
+                    seed_x = click_x - original_width
+                    seed_y = click_y
+                    edited_image = texture_segmentation_from_seed(edited_image, (seed_x, seed_y))
+                    segmentation_waiting_for_click = False
+                    print("Segmentation done")
+                else:
+                    print("Click on RIGHT image")
             show_side_by_side(original_image, edited_image, window_title)
             print_menu()
 
