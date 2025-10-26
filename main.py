@@ -4,6 +4,7 @@ import numpy as np
 from tkinter import Tk, filedialog
 import threading
 import queue
+import math
 
 
 
@@ -109,12 +110,12 @@ def detect_hough_circles(input_image):
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
-        dp=2.5,
-        minDist=10,
-        param1=260,
-        param2=120,
-        minRadius=0,
-        maxRadius=0
+        dp=2.8,
+        minDist=1,
+        param1=290,
+        param2=140,
+        minRadius=1,
+        maxRadius=150
     )
 
     output = input_image.copy()
@@ -179,7 +180,120 @@ def texture_segmentation_from_seed(input_image, seed_point, window_size=11, t_me
     result[mask] = (input_image[mask] * 0.7 + np.array([0, 0, 255])).clip(0, 255).astype(np.uint8)  # red tint
     return result
 
+def detect_clock_time(input_image):
+    # Detect dial, find two hands, print time, draw overlay on a copy
+    def _detect_circle(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (7, 7), 1.5)
+        h, w = gray.shape[:2]
+        circles = cv2.HoughCircles(
+            blur, cv2.HOUGH_GRADIENT,
+            dp=1.2, minDist=min(h, w)//3,
+            param1=150, param2=60,
+            minRadius=int(min(h, w)*0.10),
+            maxRadius=int(min(h, w)*0.60)
+        )
+        if circles is None: return None
+        cx, cy, r = circles[0, 0]
+        return int(round(cx)), int(round(cy)), int(round(r))
 
+    def _angle_cw(cx, cy, tip_x, tip_y):
+        dx, dy = tip_x - cx, tip_y - cy
+        return (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+
+    def _detect_two_lines(img, circle):
+        cx, cy, r = circle
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mask = np.zeros_like(gray); cv2.circle(mask, (cx, cy), int(r*0.95), 255, -1)
+        dial = cv2.bitwise_and(gray, gray, mask=mask)
+        binv = cv2.threshold(dial, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        binv = cv2.morphologyEx(binv, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)), 1)
+        binv = cv2.morphologyEx(binv, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)), 1)
+        inner = np.zeros_like(binv); cv2.circle(inner, (cx, cy), int(r*0.78), 255, -1)
+        bin_inner = cv2.bitwise_and(binv, binv, mask=inner)
+        edges = cv2.Canny(bin_inner, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
+                                minLineLength=int(0.15*r), maxLineGap=int(0.06*r))
+        cand = []
+        if lines is not None:
+            def d_ps(px, py, x1, y1, x2, y2):
+                ax, ay, bx, by = x1, y1, x2, y2
+                abx, aby = bx-ax, by-ay
+                apx, apy = px-ax, py-ay
+                ab2 = abx*abx + aby*aby
+                t = 0.0 if ab2==0 else max(0.0, min(1.0, (apx*abx+apy*aby)/ab2))
+                cx_, cy_ = ax + t*abx, ay + t*aby
+                return math.hypot(px-cx_, py-cy_)
+            tol = int(0.08*r)
+            for (x1,y1,x2,y2) in lines[:,0]:
+                if d_ps(cx,cy,x1,y1,x2,y2) > tol: continue
+                d1 = (x1-cx)**2 + (y1-cy)**2
+                d2 = (x2-cx)**2 + (y2-cy)**2
+                tx, ty = (x1,y1) if d1>d2 else (x2,y2)
+                length = math.hypot(tx-cx, ty-cy)
+                ang = _angle_cw(cx, cy, tx, ty)
+                cand.append((ang, length, (cx,cy,tx,ty)))
+        cand.sort(key=lambda t: t[1], reverse=True)
+        selected = []
+        for ang, length, line in cand:
+            if all(min(abs(ang-a), 360-abs(ang-a)) >= 8.0 for a,_,_ in selected):
+                selected.append((ang, length, line))
+            if len(selected) >= 2: break
+        if len(selected) < 2:
+            angles = np.arange(0, 360, 1.0)
+            rs = np.linspace(r*0.10, r*0.75, int(r*0.65))
+            score = np.zeros_like(angles, np.float32)
+            runmax = np.zeros_like(angles, np.float32)
+            h, w = bin_inner.shape
+            for i, ang in enumerate(angles):
+                dx = math.sin(math.radians(ang)); dy = -math.cos(math.radians(ang))
+                run = best = 0; s = 0
+                for rr in rs:
+                    x = int(round(cx + dx*rr)); y = int(round(cy + dy*rr))
+                    if 0 <= x < w and 0 <= y < h:
+                        v = 1 if bin_inner[y, x] else 0
+                        s += v; run = run + 1 if v else 0; best = max(best, run)
+                score[i] = s; runmax[i] = best
+            comb = score + 0.5*runmax
+            idxs = comb.argsort()[::-1]; peaks = []
+            for idx in idxs:
+                ang = float(angles[idx])
+                if all(min(abs(ang-p), 360-abs(ang-p)) >= 15.0 for p in peaks):
+                    peaks.append(ang)
+                if len(peaks) >= 2: break
+            for ang in peaks:
+                dx = math.sin(math.radians(ang)); dy = -math.cos(math.radians(ang))
+                tx = int(round(cx + dx*r*0.9)); ty = int(round(cy + dy*r*0.9))
+                L = math.hypot(tx-cx, ty-cy)
+                selected.append((ang, L, (cx,cy,tx,ty)))
+            selected.sort(key=lambda t: t[1], reverse=True)
+            selected = selected[:2]
+        if not selected: return None, None
+        if len(selected) == 1: return selected[0][2], selected[0][2]
+        minute_line = selected[0][2] if selected[0][1] >= selected[1][1] else selected[1][2]
+        hour_line   = selected[1][2] if selected[0][1] >= selected[1][1] else selected[0][2]
+        return hour_line, minute_line
+
+    circle = _detect_circle(input_image)
+    if not circle: return input_image
+    cx, cy, r = circle
+    hour_line, minute_line = _detect_two_lines(input_image, circle)
+    if minute_line is None: return input_image
+
+    hour_angle   = _angle_cw(cx, cy, hour_line[2],   hour_line[3])
+    minute_angle = _angle_cw(cx, cy, minute_line[2], minute_line[3])
+    minutes = int(round(minute_angle / 6.0)) % 60
+    hours   = int(round(((hour_angle - 0.5 * minutes) % 360.0) / 30.0)) % 12
+    hours   = 12 if hours == 0 else hours
+    print(f"{hours:02d}:{minutes:02d}")
+
+    out = input_image.copy()
+    cv2.circle(out, (cx, cy), r, (0, 255, 255), 2)
+    cv2.line(out, (hour_line[0],hour_line[1]), (hour_line[2],hour_line[3]), (255,0,0), 4, cv2.LINE_AA)
+    cv2.line(out, (minute_line[0],minute_line[1]), (minute_line[2],minute_line[3]), (0,0,255), 3, cv2.LINE_AA)
+    cv2.putText(out, f"{hours:02d}:{minutes:02d}", (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 2, cv2.LINE_AA)
+    return out
 def save_image_via_dialog(image_to_save):
     # Save image via file dialog
     root = Tk()
@@ -225,6 +339,7 @@ def print_menu():
     print("16 - Hough circles")
     print("17 - local stats (mean/std)")
     print("18 - texture segmentation (click seed on RIGHT image)")
+    print("19 - detect clock time")
     print("0 - exit")
     print("Enter command:")
 
@@ -287,6 +402,7 @@ def main():
     input_thread = threading.Thread(target=read_console_commands, args=(command_queue,), daemon=True)
     input_thread.start()
 
+
     running = True
     while running:
         cv2.waitKey(30)
@@ -347,6 +463,8 @@ def main():
             elif command == "18":
                 print("Click seed on RIGHT image to segment by local texture similarity")
                 segmentation_waiting_for_click = True
+            elif command == "19":
+                edited_image = detect_clock_time(edited_image)
             elif command == "0":
                 running = False
             if segmentation_waiting_for_click and not mouse_click_queue.empty():
